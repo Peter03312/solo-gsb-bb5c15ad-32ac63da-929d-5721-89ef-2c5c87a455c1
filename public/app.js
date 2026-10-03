@@ -1645,6 +1645,7 @@ const cut = {
   publications: [],
   orders: [],
   detailId: null,
+  replace: { preview: null, panelOpen: false, targetId: null, copies: undefined, gap: undefined },
 };
 
 function cutBanner(kind, msg) {
@@ -1803,8 +1804,11 @@ function cutStockBadge(p, isPreview) {
     }
     return `<div class="stock-badge ok">✓ 各色原片库存充足（共 ${p.totalSheets} 张；预览不占库存）</div>`;
   }
-  return `<div class="stock-badge ${p.status === 'confirmed' ? 'ok' : 'cancel'}">
-    ${p.status === 'confirmed' ? '✓ 已确认（各色所需原片已原子预留）' : '已取消（预留已释放）'}</div>`;
+  return `<div class="stock-badge ${p.status === 'confirmed' ? 'ok' : p.status === 'replaced' ? 'cancel' : 'cancel'}">
+    ${p.status === 'confirmed' ? '✓ 已确认（各色所需原片已原子预留）'
+      : p.status === 'replaced'
+        ? `↪ 已替换：旧单已退出预留，由新单 <a href="#" id="lnkReplacedBy" class="pub-link">#${p.replacedBy ? p.replacedBy.newOrderId : ''}</a> 承接，不可再取消或修改`
+        : '已取消（预留已释放）'}</div>`;
 }
 
 // mode: { preview: obj } 或 { order: obj }
@@ -1816,8 +1820,11 @@ function renderCutDetail(mode) {
   html += `<div class="plan-head">
     <div><b>${isPreview ? '排样预览（不落库、不占库存）' : `裁片订单 #${p.id} · ${escapeHtml(p.name)}`}</b></div>
     <div class="muted">发布版 v${p.version} · ${p.copies} 件 · 片间最小间距 ${p.gap} mm ·
-      总裁片数 <b>${p.totalSheets}</b> / ${p.maxSheets} 张</div></div>`;
+      总裁片数 <b>${p.totalSheets}</b> / ${p.maxSheets} 张${p.status === 'replaced' ? ' · <span class="badge" style="background:#eee;color:#888">已替换</span>' : ''}</div></div>`;
   html += cutStockBadge(p, isPreview);
+  if (!isPreview && p.replacedFrom) {
+    html += `<div class="hint">本单由旧单 <a href="#" class="pub-link" id="lnkReplacedFrom">#${p.replacedFrom.oldOrderId}</a>（v${p.replacedFrom.oldPublicationId}）换单而来，已永久绑定发布快照 v${p.version}。</div>`;
+  }
 
   html += '<div class="cut-color-summary"><table><thead><tr><th>颜色</th><th class="num">原片宽×高</th><th class="num">用板</th><th class="num">库存</th><th class="num">已预留</th><th class="num">可用</th><th class="num">缺口</th></tr></thead><tbody>';
   for (const c of p.colors) {
@@ -1858,8 +1865,20 @@ function renderCutDetail(mode) {
     html += `<div class="btn-row">
       <button id="btnCutConfirm" class="primary">确认订单（预留 ${p.totalSheets} 张）</button>
       <button id="btnCutDelete" class="danger">删除草稿</button></div>`;
-  } else if (p.status === 'confirmed') {
-    html += '<div class="btn-row"><button id="btnCutCancel" class="danger">取消订单（释放预留）</button></div>';
+  } else if (p.status === 'confirmed' && !p.replacedBy) {
+    html += `<div class="btn-row">
+      <button id="btnCutCancel" class="danger">取消订单（释放预留）</button>
+      <button id="btnCutReplace" class="primary">换单（改图纸后换到新版本）</button></div>`;
+  }
+  if (!isPreview && cut.replace.panelOpen && cut.replace.preview?.oldOrderId !== p.id && p.canReplace) {
+    html += renderReplacePanel(p);
+  }
+  if (!isPreview && p.status === 'replaced' && p.replacedBy) {
+    html += `<div class="hint">已通过换单替换为新单 #${p.replacedBy.newOrderId}。</div>`;
+  }
+  // 换单预览（若已生成）
+  if (!isPreview && cut.replace.preview && cut.replace.preview.oldOrderId === p.id) {
+    html += renderReplaceResult(cut.replace.preview);
   }
 
   document.getElementById('cutPreviewContent').innerHTML = html;
@@ -1872,6 +1891,170 @@ function renderCutDetail(mode) {
   if (de) de.addEventListener('click', () => deleteCutOrder(p.id));
   const ca = document.getElementById('btnCutCancel');
   if (ca) ca.addEventListener('click', () => cancelCutOrder(p.id));
+  const br = document.getElementById('btnCutReplace');
+  if (br) br.addEventListener('click', () => toggleReplacePanel(p.id));
+  const bprev = document.getElementById('btnReplacePreview');
+  if (bprev) bprev.addEventListener('click', () => previewReplace(p.id));
+  const bconf = document.getElementById('btnReplaceConfirm');
+  if (bconf) bconf.addEventListener('click', () => confirmReplace(p.id));
+  const bcancel = document.getElementById('btnReplaceCancel');
+  if (bcancel) bcancel.addEventListener('click', () => { cut.replace.preview = null; renderCutDetail({ order: p }); });
+  const lnkFrom = document.getElementById('lnkReplacedFrom');
+  if (lnkFrom) lnkFrom.addEventListener('click', (e) => {
+    e.preventDefault();
+    if (p.replacedFrom) openOrder(p.replacedFrom.oldOrderId);
+  });
+  const lnkBy = document.getElementById('lnkReplacedBy');
+  if (lnkBy) lnkBy.addEventListener('click', (e) => {
+    e.preventDefault();
+    if (p.replacedBy) openOrder(p.replacedBy.newOrderId);
+  });
+}
+
+// ---------- 换单 ----------
+
+// 换单参数面板：选择同图纸另一已发布版本 + 件数 + 片间距
+function renderReplacePanel(order, _state) {
+  const versions = (cut.publicationsByDesign && cut.publicationsByDesign.get(order.designId)) || [];
+  const opts = versions
+    .filter((v) => v.id !== order.publicationId)
+    .map((v) => `<option value="${v.id}" ${cut.replace.targetId === v.id ? 'selected' : ''}>v${v.version} · ${v.publishedAt}</option>`)
+    .join('');
+  return `<div class="replace-panel" id="replacePanel">
+    <h3>换单：同一图纸的另一已发布版本</h3>
+    <div class="hint">换单确认会在同一事务内让旧单退出预留并确认新单；任一颜色不足则全部保持原状。旧单将标记“已替换”，不能再取消或修改；相同参数重试返回同一新单，不重复预留。</div>
+    <label>目标发布版本（同图纸）
+      <select id="replaceVersion">${opts || '<option value="">（没有其它已发布版本）</option>'}</select>
+    </label>
+    <div class="form-row two">
+      <label>新单件数<input id="replaceCopies" type="number" min="1" step="1" value="${cut.replace.copies || order.copies}"></label>
+      <label>片间最小间距 (mm)<input id="replaceGap" type="number" min="0" max="50" step="1" value="${cut.replace.gap !== undefined ? cut.replace.gap : order.gap}"></label>
+    </div>
+    <div class="btn-row">
+      <button id="btnReplacePreview" class="primary">换单预览（不占库存）</button>
+    </div>
+  </div>`;
+}
+
+// 换单预览结果：按颜色列出旧单/新单用板、净增减、计入旧单预留后的可用量、缺口
+function renderReplaceResult(prev) {
+  const row = (c) => `<tr>
+    <td><span class="color-chip" style="background:${c.color}"></span>${c.color}</td>
+    <td class="num">${c.sheetWidth}×${c.sheetHeight}</td>
+    <td class="num">${c.oldSheets}</td>
+    <td class="num"><b>${c.requiredSheets}</b></td>
+    <td class="num ${c.netChange > 0 ? 'gap-info' : c.netChange < 0 ? '' : 'muted'}">${c.netChange > 0 ? `+${c.netChange}` : c.netChange}</td>
+    <td class="num">${c.stock}</td>
+    <td class="num">${c.reserved}</td>
+    <td class="num">${c.oldOrderReserved}</td>
+    <td class="num"><b>${c.availableAfterRelease}</b></td>
+    <td class="num">${c.shortage > 0 ? `<span class="gap-info">${c.shortage}</span>` : 0}</td>
+  </tr>`;
+  let html = `<div class="replace-result">
+    <h3>换单预览：旧单 v${prev.oldVersion} → 新排样 v${prev.targetVersion}（${prev.copies} 件，间距 ${prev.gap} mm）</h3>
+    <div class="${prev.feasible ? 'stock-badge ok' : 'stock-badge bad'}">
+      ${prev.feasible
+        ? `✓ 计入旧单预留后各色充足：旧单 ${prev.oldTotalSheets} 张 → 新单 ${prev.totalSheets} 张（净 ${prev.netSheetChange >= 0 ? '+' : ''}${prev.netSheetChange}），可确认换单`
+        : `⚠ 计入旧单预留后仍缺 ${prev.totalShortage} 张，不能确认换单（预览不占库存）`}
+    </div>
+    <table><thead><tr>
+      <th>颜色</th><th class="num">原片宽×高</th>
+      <th class="num">旧单用板</th><th class="num">新单用板</th><th class="num">净增减</th>
+      <th class="num">库存</th><th class="num">已预留</th><th class="num">旧单预留</th>
+      <th class="num">换单后可用</th><th class="num">缺口</th>
+    </tr></thead><tbody>
+    ${prev.colors.map(row).join('')}
+    </tbody></table>
+    <div class="btn-row">
+      <button id="btnReplaceConfirm" class="primary" ${prev.feasible ? '' : 'disabled'}>确认换单（同事务替换）</button>
+      <button id="btnReplaceCancel" class="danger">收起预览</button>
+    </div>
+  </div>`;
+  // 附新排样逐张示意（精简）
+  html += '<div class="cut-sheets">';
+  for (const c of prev.layout.colors) {
+    html += `<h3><span class="color-chip" style="background:${c.color}"></span>新排样 ${c.color} · ${c.sheetWidth}×${c.sheetHeight} mm · ${c.sheets.length} 张</h3>`;
+    for (const sheet of c.sheets) {
+      html += `<div class="cut-sheet-card">
+        <div class="bar-title">原片 #${sheet.index}（${sheet.width}×${sheet.height} mm）· ${sheet.placements.length} 片</div>
+        ${sheetSvg(sheet, c.color)}
+        <table><tbody>`;
+      for (const q of sheet.placements.slice(0, 12)) {
+        html += `<tr><td>#${q.pieceNo}</td><td>第${q.copy}件</td><td class="num">${q.rotation}°</td><td class="num muted">${q.x},${q.y}</td></tr>`;
+      }
+      if (sheet.placements.length > 12) html += `<tr><td colspan="4" class="muted">… 其余 ${sheet.placements.length - 12} 片见订单详情</td></tr>`;
+      html += '</tbody></table></div>';
+    }
+  }
+  html += '</div></div>';
+  return html;
+}
+
+async function toggleReplacePanel(orderId) {
+  const order = cut.orders.find((o) => o.id === orderId);
+  if (!order) return;
+  cut.replace.panelOpen = !cut.replace.panelOpen;
+  if (!cut.replace.panelOpen) { cut.replace.preview = null; renderCutDetail({ order }); return; }
+  await ensurePublicationsForDesign(order.designId);
+  if (cut.replace.copies === undefined) cut.replace.copies = order.copies;
+  if (cut.replace.gap === undefined) cut.replace.gap = order.gap;
+  renderCutDetail({ order });
+  document.getElementById('replacePanel')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function ensurePublicationsForDesign(designId) {
+  if (!cut.publicationsByDesign) cut.publicationsByDesign = new Map();
+  const data = await api('GET', `/api/designs/${designId}/publications`);
+  cut.publicationsByDesign.set(designId, data.publications);
+}
+
+function replaceInputs(orderId) {
+  return {
+    targetPublicationId: Number(document.getElementById('replaceVersion').value),
+    copies: Number(document.getElementById('replaceCopies').value),
+    gap: Number(document.getElementById('replaceGap').value),
+    orderId,
+  };
+}
+
+async function previewReplace(orderId) {
+  const order = cut.orders.find((o) => o.id === orderId);
+  if (!order) return;
+  const body = replaceInputs(orderId);
+  cut.replace.targetId = body.targetPublicationId;
+  cut.replace.copies = body.copies;
+  cut.replace.gap = body.gap;
+  if (!body.targetPublicationId) { cutBanner('error', '该图纸没有其它已发布版本可换'); return; }
+  try {
+    const data = await api('POST', `/api/cut-orders/${orderId}/replacements/preview`, body);
+    cut.replace.preview = data.preview;
+    renderCutDetail({ order });
+    cutBanner(false);
+  } catch (err) {
+    cutBanner('error', '⛔ ' + (err.data?.error || err.message));
+  }
+}
+
+async function confirmReplace(orderId) {
+  const body = replaceInputs(orderId);
+  if (!confirm(`确认把订单 #${orderId} 换到所选新版本？旧单将立即退出预留并标记“已替换”，新单在同一事务内确认；任一颜色不足则全部保持原状。`)) return;
+  try {
+    const data = await api('POST', `/api/cut-orders/${orderId}/replacements`, body);
+    cut.replace = { preview: null, panelOpen: false, targetId: null, copies: undefined, gap: undefined };
+    cutBanner('success', data.idempotent
+      ? `✓ 参数相同，返回原新单 #${data.newOrder.id}（未重复预留）`
+      : `✓ 换单成功：旧单 #${orderId} 已替换，新单 #${data.newOrder.id} 已确认`);
+    await loadGlassSheets();
+    await loadCutOrders(data.newOrder.id);
+  } catch (err) {
+    const d = err.data || {};
+    cutBanner('error', '⛔ ' + (d.error || err.message));
+    if (d.preview) { cut.replace.preview = d.preview; renderCutDetail({ order: cut.orders.find((o) => o.id === orderId) }); }
+  }
+}
+
+async function openOrder(id) {
+  await loadCutOrders(id);
 }
 
 // 单张原片排样示意 SVG：viewBox 取原片毫米尺寸，y 轴翻转（屏幕坐标向下）
@@ -1958,13 +2141,18 @@ function renderCutOrderList() {
       ? '<span class="badge ok">已确认</span>'
       : o.status === 'canceled'
         ? '<span class="badge" style="background:#eee;color:#888">已取消</span>'
-        : '<span class="badge bad">草稿</span>';
+        : o.status === 'replaced'
+          ? '<span class="badge" style="background:#f3e8ff;color:#6b3fa0">已替换</span>'
+          : '<span class="badge bad">草稿</span>';
     const colors = o.colors.map((c) =>
       `<span class="color-chip" style="background:${c.color}" title="${c.color} ×${c.requiredSheets}"></span>`).join('');
     const warn = o.status === 'draft' && o.totalShortage > 0
       ? ` <span class="gap-info">缺 ${o.totalShortage} 张</span>` : '';
+    const repl = o.status === 'replaced' && o.replacedBy
+      ? ` <span class="muted small">→ 新单 #${o.replacedBy.newOrderId}</span>`
+      : o.replacedFrom ? ` <span class="muted small">← 换自 #${o.replacedFrom.oldOrderId}</span>` : '';
     return `<div class="plan-item${cut.detailId === o.id ? ' active' : ''}" data-id="${o.id}">
-      <div>${badge} <b>#${o.id}</b> ${escapeHtml(o.name)}${warn}</div>
+      <div>${badge} <b>#${o.id}</b> ${escapeHtml(o.name)}${warn}${repl}</div>
       <div class="muted small">v${o.version} · ${o.copies}件 · 间距 ${o.gap}mm · ${o.totalSheets} 张 ${colors}</div>
     </div>`;
   }).join('');
@@ -1972,6 +2160,7 @@ function renderCutOrderList() {
     div.addEventListener('click', () => {
       const o = cut.orders.find((x) => x.id === Number(div.dataset.id));
       cut.detailId = o.id;
+      cut.replace = { preview: null, panelOpen: false, targetId: null, copies: undefined, gap: undefined };
       renderCutOrderList();
       renderCutDetail({ order: o });
     });

@@ -94,12 +94,13 @@ function init(dbPath) {
       updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
     );
 
-    -- 裁片订单：草稿不占库存；confirmed 原子预留各色原片；canceled 释放。
+    -- 裁片订单：草稿不占库存；confirmed 原子预留各色原片；canceled 释放；replaced 换单退出预留。
     -- 绑定发布快照（publication 不可变）；草稿变化/再发布不影响已确认订单。
+    -- 换单成功后旧单置为 replaced（退出预留、不可再取消/修改/删除），新单同事务确认。
     CREATE TABLE IF NOT EXISTS cut_orders (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
       name          TEXT    NOT NULL,
-      status        TEXT    NOT NULL CHECK (status IN ('draft','confirmed','canceled')),
+      status        TEXT    NOT NULL CHECK (status IN ('draft','confirmed','canceled','replaced')),
       publication_id INTEGER NOT NULL REFERENCES publications(id),
       design_id     INTEGER NOT NULL,
       version       INTEGER NOT NULL,
@@ -110,7 +111,8 @@ function init(dbPath) {
       created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
       updated_at    TEXT    NOT NULL DEFAULT (datetime('now')),
       confirmed_at  TEXT,
-      canceled_at   TEXT
+      canceled_at   TEXT,
+      replaced_at   TEXT                           -- 换单退出预留时间（replaced 单专属）
     );
 
     -- 订单分色明细：确认时按色预留 required_sheets 张（原子）。
@@ -129,8 +131,77 @@ function init(dbPath) {
     CREATE INDEX IF NOT EXISTS idx_cutorders_pub    ON cut_orders(publication_id);
     CREATE INDEX IF NOT EXISTS idx_cutitems_sheet   ON cut_order_items(sheet_id);
     CREATE INDEX IF NOT EXISTS idx_cutitems_order   ON cut_order_items(order_id);
+
+    -- 裁片换单记录：一次“已确认旧单 → 同一图纸另一已发布版本的新单”。
+    -- 旧单退出预留置为 replaced，新单在同一事务内创建并确认；同一旧单仅一条记录（幂等键）。
+    CREATE TABLE IF NOT EXISTS cut_order_replacements (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      old_order_id      INTEGER NOT NULL UNIQUE REFERENCES cut_orders(id),
+      new_order_id      INTEGER NOT NULL UNIQUE REFERENCES cut_orders(id),
+      old_publication_id INTEGER NOT NULL,
+      new_publication_id INTEGER NOT NULL,
+      copies            INTEGER NOT NULL CHECK (copies > 0),
+      gap_mm            INTEGER NOT NULL CHECK (gap_mm BETWEEN 0 AND 50),
+      -- 幂等参数签名：同一旧单相同新发布版/件数/间距重复确认返回同一新单
+      param_signature   TEXT    NOT NULL,
+      created_at        TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_cutrepl_new ON cut_order_replacements(new_order_id);
   `);
+
+  // 旧版数据库迁移：补 replaced 状态与 replaced_at 列（CHECK 约束变更需重建表）。
+  migrateCutOrders();
   return db;
+}
+
+// 检测并迁移旧 schema 的 cut_orders：新增 replaced 状态与 replaced_at 列。
+// SQLite 不能直接改 CHECK，采用 12 步表重建（外键关闭/恢复、数据复制、序列保留）。
+function migrateCutOrders() {
+  const d = getDb();
+  const cols = d.prepare("PRAGMA table_info(cut_orders)").all();
+  const statusCheck = d.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='cut_orders'").get();
+  const hasReplacedAt = cols.some((c) => c.name === 'replaced_at');
+  const allowsReplaced = !!statusCheck && /replaced/.test(statusCheck.sql);
+  if (hasReplacedAt && allowsReplaced) return;
+
+  d.pragma('foreign_keys = OFF');
+  d.exec('BEGIN');
+  try {
+    d.exec(`
+      CREATE TABLE cut_orders_new (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        name          TEXT    NOT NULL,
+        status        TEXT    NOT NULL CHECK (status IN ('draft','confirmed','canceled','replaced')),
+        publication_id INTEGER NOT NULL REFERENCES publications(id),
+        design_id     INTEGER NOT NULL,
+        version       INTEGER NOT NULL,
+        copies        INTEGER NOT NULL CHECK (copies > 0),
+        gap_mm        INTEGER NOT NULL CHECK (gap_mm BETWEEN 0 AND 50),
+        total_sheets  INTEGER NOT NULL CHECK (total_sheets BETWEEN 1 AND 60),
+        layout        TEXT    NOT NULL,
+        created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+        updated_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+        confirmed_at  TEXT,
+        canceled_at   TEXT,
+        replaced_at   TEXT
+      );
+    `);
+    const colList = cols.map((c) => c.name).join(', ');
+    d.exec(`INSERT INTO cut_orders_new (${colList}) SELECT ${colList} FROM cut_orders`);
+    d.exec('DROP TABLE cut_orders');
+    d.exec('ALTER TABLE cut_orders_new RENAME TO cut_orders');
+    d.exec(`
+      CREATE INDEX IF NOT EXISTS idx_cutorders_status ON cut_orders(status);
+      CREATE INDEX IF NOT EXISTS idx_cutorders_pub    ON cut_orders(publication_id);
+    `);
+    d.exec('COMMIT');
+  } catch (e) {
+    d.exec('ROLLBACK');
+    d.pragma('foreign_keys = ON');
+    throw e;
+  }
+  d.pragma('foreign_keys = ON');
 }
 
 function getDb() {
@@ -617,6 +688,7 @@ function rowToCutOrder(row) {
     updatedAt: row.updated_at,
     confirmedAt: row.confirmed_at || null,
     canceledAt: row.canceled_at || null,
+    replacedAt: row.replaced_at || null,
   };
 }
 
@@ -742,10 +814,12 @@ function confirmCutOrder(id) {
 }
 
 // 取消：只有已确认订单释放预留；重复取消不会再次改库存。
+// replaced（已替换）单不能取消（其预留已在换单事务中转给新单）。
 function cancelCutOrder(id) {
   const d = getDb();
   const row = getCutOrderRow(id);
   if (!row) return { code: 'not_found' };
+  if (row.status === 'replaced') return { code: 'replaced_locked' };
   if (row.status === 'draft') return { code: 'draft_not_reserved' };
   if (row.status === 'canceled') return { code: 'already_canceled' };
   d.exec('BEGIN IMMEDIATE');
@@ -765,8 +839,165 @@ function deleteCutOrder(id) {
   const row = getCutOrderRow(id);
   if (!row) return { code: 'not_found' };
   if (row.status === 'confirmed') return { code: 'confirmed_delete_blocked' };
+  if (row.status === 'replaced') return { code: 'replaced_locked' };
   getDb().prepare('DELETE FROM cut_orders WHERE id = ?').run(id); // 子表 ON DELETE CASCADE
   return { code: 'ok' };
+}
+
+// ---------- 裁片订单换单 ----------
+
+function getReplacementByOldOrder(oldOrderId) {
+  const d = getDb();
+  const row = d.prepare('SELECT * FROM cut_order_replacements WHERE old_order_id = ?').get(oldOrderId);
+  if (!row) return null;
+  return {
+    id: row.id,
+    oldOrderId: row.old_order_id,
+    newOrderId: row.new_order_id,
+    oldPublicationId: row.old_publication_id,
+    newPublicationId: row.new_publication_id,
+    copies: row.copies,
+    gap: row.gap_mm,
+    paramSignature: row.param_signature,
+    createdAt: row.created_at,
+  };
+}
+
+function getReplacementByNewOrder(newOrderId) {
+  const d = getDb();
+  const row = d.prepare('SELECT * FROM cut_order_replacements WHERE new_order_id = ?').get(newOrderId);
+  if (!row) return null;
+  return {
+    id: row.id,
+    oldOrderId: row.old_order_id,
+    newOrderId: row.new_order_id,
+    oldPublicationId: row.old_publication_id,
+    newPublicationId: row.new_publication_id,
+    copies: row.copies,
+    gap: row.gap_mm,
+    paramSignature: row.param_signature,
+    createdAt: row.created_at,
+  };
+}
+
+// 换单参数签名（幂等键的一部分）：新发布版 id + 件数 + 间距
+function replacementSignature({ newPublicationId, copies, gap }) {
+  return `pub=${newPublicationId};copies=${copies};gap=${gap}`;
+}
+
+// 换单：同一 BEGIN IMMEDIATE 事务内让旧单退出预留（replaced），
+// 并创建、确认绑定新发布版快照的新单。任一颜色库存不足则整事务回滚，
+// 旧单状态、库存、订单记录均保持原状，并返回各色缺口。
+//
+// 幂等：同一旧单已有换单记录时：
+//   - 参数签名相同 → 返回 { code:'idempotent', replacement }（不重复预留）
+//   - 参数签名不同 → 返回 { code:'param_conflict', replacement }
+function replaceCutOrder(oldId, o) {
+  const d = getDb();
+  const sig = replacementSignature({
+    newPublicationId: o.publicationId,
+    copies: o.copies,
+    gap: o.gap,
+  });
+  d.exec('BEGIN IMMEDIATE');
+  try {
+    const existing = d.prepare('SELECT * FROM cut_order_replacements WHERE old_order_id = ?').get(oldId);
+    if (existing) {
+      d.exec('ROLLBACK');
+      if (existing.param_signature === sig) {
+        return { code: 'idempotent', replacement: getReplacementByOldOrder(oldId) };
+      }
+      return { code: 'param_conflict', replacement: getReplacementByOldOrder(oldId) };
+    }
+
+    const oldRow = getCutOrderRow(oldId);
+    if (!oldRow) { d.exec('ROLLBACK'); return { code: 'not_found' }; }
+    if (oldRow.status === 'replaced') {
+      // 理论上有 replacement 记录即上面已返回；双保险
+      d.exec('ROLLBACK');
+      return { code: 'already_replaced' };
+    }
+    if (oldRow.status === 'canceled') { d.exec('ROLLBACK'); return { code: 'order_canceled' }; }
+    if (oldRow.status === 'draft') { d.exec('ROLLBACK'); return { code: 'draft_not_confirmed' }; }
+
+    const shortages = [];
+    for (const it of o.items) {
+      const sheet = getGlassSheetRow(it.sheetId);
+      if (!sheet) {
+        d.exec('ROLLBACK');
+        return { code: 'sheet_missing', color: it.color };
+      }
+      if (sheet.width_mm !== it.width || sheet.height_mm !== it.height) {
+        d.exec('ROLLBACK');
+        return { code: 'sheet_changed', color: it.color };
+      }
+      // 当前已确认预留总量；旧单即将退出，其预留（按色）计入新单可用量
+      const reservedNow = d
+        .prepare(`SELECT COALESCE(SUM(ci.required_sheets),0) AS n
+                  FROM cut_order_items ci JOIN cut_orders co ON co.id = ci.order_id
+                  WHERE ci.sheet_id = ? AND co.status = 'confirmed'`).get(it.sheetId).n;
+      const oldItem = d
+        .prepare('SELECT COALESCE(SUM(required_sheets),0) AS n FROM cut_order_items WHERE order_id = ? AND sheet_id = ?')
+        .get(oldId, it.sheetId).n;
+      const availableAfterRelease = sheet.stock - reservedNow + oldItem;
+      if (it.requiredSheets > availableAfterRelease) {
+        shortages.push({
+          color: it.color,
+          required: it.requiredSheets,
+          oldUsed: oldItem,
+          available: availableAfterRelease,
+          shortage: it.requiredSheets - availableAfterRelease,
+        });
+      }
+    }
+    if (shortages.length) {
+      d.exec('ROLLBACK');
+      return { code: 'shortage', shortages };
+    }
+
+    // 创建新单（直接置为 confirmed，与旧单退出同一事务）
+    const ins = d.prepare(`INSERT INTO cut_orders
+      (name, status, publication_id, design_id, version, copies, gap_mm, total_sheets, layout, confirmed_at)
+      VALUES (?, 'confirmed', ?, ?, ?, ?, ?, ?, ?, datetime('now'))`);
+    const info = ins.run(o.name, o.publicationId, o.designId, o.version, o.copies, o.gap,
+      o.totalSheets, JSON.stringify(o.layout));
+    const newId = info.lastInsertRowid;
+    const insItem = d.prepare(`INSERT INTO cut_order_items
+      (order_id, sheet_id, sheet_color, sheet_width_mm, sheet_height_mm, required_sheets)
+      VALUES (?, ?, ?, ?, ?, ?)`);
+    for (const it of o.items) {
+      insItem.run(newId, it.sheetId, it.color, it.width, it.height, it.requiredSheets);
+    }
+
+    // 旧单退出预留
+    d.prepare(`UPDATE cut_orders
+      SET status = 'replaced', replaced_at = datetime('now'), updated_at = datetime('now')
+      WHERE id = ? AND status = 'confirmed'`).run(oldId);
+
+    d.prepare(`INSERT INTO cut_order_replacements
+      (old_order_id, new_order_id, old_publication_id, new_publication_id, copies, gap_mm, param_signature)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(oldId, newId, o.oldPublicationId, o.publicationId, o.copies, o.gap, sig);
+
+    d.exec('COMMIT');
+    return {
+      code: 'ok',
+      replacement: {
+        oldOrderId: oldId,
+        newOrderId: newId,
+        oldPublicationId: o.oldPublicationId,
+        newPublicationId: o.publicationId,
+        copies: o.copies,
+        gap: o.gap,
+        paramSignature: sig,
+      },
+      oldOrder: getCutOrder(oldId),
+      newOrder: getCutOrder(newId),
+    };
+  } catch (e) {
+    d.exec('ROLLBACK');
+    throw e;
+  }
 }
 
 module.exports = {
@@ -780,4 +1011,5 @@ module.exports = {
   createGlassSheet, updateGlassSheetStock,
   createCutOrder, getCutOrder, listCutOrders, listCutOrderItems, updateCutOrderDraft,
   confirmCutOrder, cancelCutOrder, deleteCutOrder,
+  replaceCutOrder, getReplacementByOldOrder, getReplacementByNewOrder, replacementSignature,
 };

@@ -10,6 +10,8 @@
 
 还可直接从**彩色玻璃原片裁出已发布图纸的拼片**：每种颜色登记一种原片规格（宽高为 1–2000 整数毫米）与库存张数（调整库存不得低于已预留数）；选择发布版本、制作件数与片间最小间距（0–50 整数毫米）后按快照颜色排样，总裁片数最多 60 张；每片只可平移或旋转 90° 的整数倍，不得镜像、越板或与同板其他片轮廓净距不足。预览给出逐张原片的片号、件次、旋转角度、放置坐标与轮廓，以及各色用板数与库存缺口；确认时**原子预留所有颜色**的所需原片，并发不超卖；计划永久绑定发布快照。
 
+裁片订单确认后图纸又有改动时，工作室可**换单**：从一张已确认订单换到**同一图纸的另一已发布版本**，重新输入件数与片间距。换单预览按颜色对比旧单与新排样的用板数、净增减、**计入旧单预留后的可用量**及缺口，全程不占库存；确认换单在**同一事务**内让旧单退出预留、新单确认，任一颜色不足则旧单、库存与订单记录**全部保持原状**并返回各色缺口。成功后两单各自的发布快照与排样都可查，旧单标记**已替换（replaced）**，不能再取消或修改；对同一旧单按相同参数重试**返回原新单**，不同参数报 **409 冲突**，均不会重复预留。
+
 ## 功能一览
 
 - **窗框建模**：宽、高为正整数毫米（1–100000）。
@@ -60,6 +62,14 @@
   - **原子预留与并发**：确认在一个 `BEGIN IMMEDIATE` 事务中逐色核对并预留，**任一颜色库存不足则整单失败、不留部分**；多订单并发也**不会超卖**。
   - **幂等与快照**：重复确认不重复预留；取消只释放一次（重复取消返回 409 且不再改库存）；已确认订单不可改、不可删（须先取消）；订单永久绑定发布快照，草稿改动或再发布均不改变已确认方案。
   - 网页“玻璃裁片”标签可登记原片、排样预览、存草稿、确认/取消订单并查看逐张排样示意。
+- **裁片换单（本轮新增）**：
+  - **适用对象**：仅**已确认**的裁片订单可换单；草稿、已取消订单明确拒绝；旧单只能换到**同一图纸**的**另一已发布版本**（无效版本 404、非同图纸 400 `different_design`、同版本 400 `same_publication`）。
+  - **换单预览**：输入 `targetPublicationId`、件数、片间距，按颜色列出**旧单用板、新单用板、净增减、库存、当前已预留、旧单本单预留、计入旧单预留后的可用量（availableAfterRelease = 当前可用 + 旧单本单预留）、缺口**，以及旧/新总用板与净变化；预览不落库、不占库存。
+  - **同事务替换**：确认换单在一个 `BEGIN IMMEDIATE` 事务内逐色核对（旧单预留计入新单可用量）→ 创建并确认新单 → 旧单置为 `replaced` 并写换单记录；**任一颜色不足即回滚整事务**（409 `shortage`，返回每色缺口），旧单状态、库存与订单记录均不变。
+  - **新排样约束不变**：仍遵守现有几何规则（仅平移/90° 旋转、不镜像、不越板、净距 ≥ gap）、颜色规格（缺色 422 `missing_color`、单片放不下 422 `piece_too_large`）与**总用板 60 上限**（422 `too_many_sheets`）。
+  - **幂等与冲突**：同一旧单按**相同参数**重试换单返回 **200 + 原新单**（`idempotent:true`，不重复预留）；**不同参数**返回 **409 `param_conflict`** 并回传既有换单关系；并发也只可能有一单成功。
+  - **换单后状态**：两单各自的**发布快照与排样永久可查**（新单 `replacedFrom` 回溯旧单，旧单 `replacedBy` 指向新单）；旧单为 `replaced`，**不能再取消、修改或删除**（均 409）；新排样不再使用的颜色自动退出预留。
+  - 网页订单详情中点“换单”即可选版本、填件数/间距、看按色对比预览并确认，结果与两单均可在列表/详情查看。
 
 ## 技术栈
 
@@ -166,7 +176,9 @@ Compose 中通过命名卷 `studio-data` 持久化 `/data`；改宿主机端口�
 | PUT | `/api/cut-orders/:id` | 修改草稿（重选版本/件数/间距并重算） |
 | POST | `/api/cut-orders/:id/confirm` | 确认并原子预留所有颜色；任一色不足返回 409（整单失败） |
 | POST | `/api/cut-orders/:id/cancel` | 取消并释放预留（只释放一次，幂等） |
-| DELETE | `/api/cut-orders/:id` | 删除草稿/已取消订单（已确认须先取消） |
+| DELETE | `/api/cut-orders/:id` | 删除草稿/已取消订单（已确认须先取消；已替换不可删） |
+| POST | `/api/cut-orders/:id/replacements/preview` | 换单预览 `{targetPublicationId,copies,gap}`（同图纸另一已发布版；按色旧/新用板、净增减、计入旧单预留后的可用量与缺口；只读不占库存） |
+| POST | `/api/cut-orders/:id/replacements` | 确认换单（同事务旧单退出预留+新单确认；不足 409 整单回滚；同参数重试 200 返回原新单，不同参数 409） |
 
 校验失败统一返回：
 
@@ -187,6 +199,7 @@ Compose 中通过命名卷 `studio-data` 持久化 `/data`；改宿主机端口�
 8. 切到“铅条生产”标签：登记原材定尺与库存根数 → 选发布版本/件数/原材/每刀损耗 → “排产预览”查看逐根切段与余料 → “存为草稿计划” → 库存足够时“确认计划”原子预留；需要退料时“取消计划”释放预留。
 9. 切到“分张打印”标签：选图纸与已发布版本 → 输入纸张宽高、四边留白与相邻页重叠（整数毫米）→ “生成拼接预览”查看行列总页数、每页覆盖坐标与拼接标记 → 逐页或一键“逐页下载全部 SVG”，打印时选择“实际大小/100%”，按重叠带与红色对位十字现场拼接。
 10. 切到“玻璃裁片”标签：按颜色登记原片宽×高（1–2000 整数 mm）与库存张数 → 选发布版本、制作件数与片间最小间距 → “排样预览”查看逐张原片的片号/件次/旋转/坐标/轮廓与各色用板、库存缺口 → “存为草稿订单” → 库存充足时“确认订单”原子预留所有颜色；需要退料时“取消订单”一次性释放。
+11. 已确认订单在图纸改版后：打开该订单详情 → “换单” → 选择同一图纸的另一已发布版本并填写件数与片间距 → “换单预览”查看按颜色的旧/新用板、净增减与计入旧单预留后的可用量/缺口 → “确认换单”：旧单同事务退出预留并标记“已替换”，新单立即确认；旧单不可再取消或修改，两单快照与排样均可随时查阅。
 
 ## 玻璃裁片排样规则
 
@@ -263,6 +276,92 @@ curl -s -X POST localhost:3000/api/cut-orders/preview -H 'Content-Type: applicat
 
 # 总裁片数超过 60
 # -> 422 {"ok":false,"code":"too_many_sheets","totalSheets":61,"maxSheets":60}
+```
+
+## 裁片订单换单规则（本轮新增）
+
+- **谁可以换**：仅 `confirmed` 订单可换（草稿可直接改、已取消/已替换拒绝）；目标必须是**同一图纸**的**另一个已发布版本**——目标版本不存在 404、非同图纸 400 `different_design`、与旧单同版本 400 `same_publication`；件数与 gap 校验同建单（copies 正整数、gap 0–50 整数）。
+- **预览口径（只读，不占库存）**：逐色给出
+  `oldSheets`（旧单用板）、`requiredSheets`（新排样用板）、`netChange`（净增减）、
+  `stock`/`reserved`（当前库存/当前已预留，含旧单）、`oldOrderReserved`（旧单本单预留）、
+  `availableAfterRelease = stock − reserved + oldOrderReserved`（**计入旧单预留后的可用量**）、
+  `shortage`（= max(0, 新用板 − 换单后可用)）；并给出 `oldTotalSheets/totalSheets/netSheetChange/totalShortage/feasible`。旧/新颜色取并集（新版本去掉的颜色净减、新增颜色净增）。
+- **原子确认**：`POST /api/cut-orders/:id/replacements` 在一个 `BEGIN IMMEDIATE` 事务内：
+  逐色核对（旧单该色预留计入可用量）→ 插入新订单（直接 `confirmed`，绑定新发布版快照与新排样 JSON）
+  → 旧单置 `replaced`（写 `replaced_at`，退出预留）→ 写换单记录。
+  **任一颜色不足即 ROLLBACK**：旧单仍为 confirmed、库存预留不变、不产生新订单，响应 409 `shortage` 附每色缺口与本次预览。
+- **幂等/冲突键**：签名 = `targetPublicationId + copies + gap`。同一旧单相同参数重试 → **200** `{idempotent:true, oldOrder, newOrder, replacement}`（新单为原单，库存零变化）；不同参数 → **409** `param_conflict`（回传既有换单关系与原新单）；并发同参只有一个 201，其余 200，不重复预留；并发异参只有一单成功，其余 409。
+- **新排样约束完全沿用建单**：整数毫米平移 + 0/90°/180°/270° 旋转、不镜像、不越板、同板净距 ≥ gap（BigInt 精确判定）；缺色 422 `missing_color`、单片放不下 422 `piece_too_large`、总用板超 **60** 422 `too_many_sheets`，整单拒绝不产生替换。
+- **换单后**：旧单 `status='replaced'`，GET 详情含 `replacedBy`；新单含 `replacedFrom`；两单的发布版本、快照与逐张排样都不变、都可查。旧单**不能取消/修改/删除**（409 `replaced_locked`）；新单是普通已确认订单，可正常取消（释放其自身预留）。
+
+### 换单调用示例（curl）
+
+```bash
+# 0) 准备：同一图纸已有 v1（publicationId=1）的已确认订单 #1；图纸改版后发布 v2（id=2）
+#    （确认旧单的过程同前：POST /api/cut-orders → /confirm）
+
+# 1) 换单预览：旧单 #1 → v2，3 件，片间距 4 mm（不落库、不占库存）
+curl -s -X POST localhost:3000/api/cut-orders/1/replacements/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"targetPublicationId":2,"copies":3,"gap":4}'
+# -> { ok:true, preview:{
+#      oldOrderId:1, oldVersion:1, targetVersion:2, copies:3, gap:4,
+#      oldTotalSheets:5, totalSheets:6, netSheetChange:1,
+#      totalShortage:0, feasible:true,
+#      colors:[{ color:"#ff0000", oldSheets:3, requiredSheets:4, netChange:1,
+#                stock:8, reserved:3, oldOrderReserved:3,
+#                availableAfterRelease:8, shortage:0, inOld:true, inNew:true }, ...],
+#      layout:{ ...新排样逐张放置（结构同 /api/cut-orders/preview）... } } }
+
+# 2) 确认换单（同事务：旧单退出预留、新单确认）
+curl -s -X POST localhost:3000/api/cut-orders/1/replacements \
+  -H 'Content-Type: application/json' \
+  -d '{"targetPublicationId":2,"copies":3,"gap":4}'
+# -> 201 { ok:true,
+#      replacement:{oldOrderId:1,newOrderId:7,oldPublicationId:1,newPublicationId:2,copies:3,gap:4},
+#      oldOrder:{ id:1, status:"replaced", replacedBy:{newOrderId:7,...}, ... },
+#      newOrder:{ id:7, status:"confirmed", publicationId:2, version:2,
+#                 replacedFrom:{oldOrderId:1,...}, layout:{...} } }
+
+# 3) 相同参数重试 → 200 返回同一新单（idempotent:true，库存零变化，不重复预留）
+curl -s -X POST localhost:3000/api/cut-orders/1/replacements \
+  -H 'Content-Type: application/json' -d '{"targetPublicationId":2,"copies":3,"gap":4}'
+# -> 200 { ok:true, idempotent:true, newOrder:{id:7,...}, ... }
+
+# 4) 不同参数（件数/间距/目标版本变化）→ 409 param_conflict，不产生第二张新单
+curl -s -X POST localhost:3000/api/cut-orders/1/replacements \
+  -H 'Content-Type: application/json' -d '{"targetPublicationId":2,"copies":5,"gap":4}'
+# -> 409 { ok:false, code:"param_conflict",
+#         error:"旧单 #1 已按其它参数换到新单 #7 ...，不能再换",
+#         existingReplacement:{...}, newOrder:{id:7,...} }
+
+# 5) 任一颜色计入旧单预留后仍不足 → 409 shortage，旧单/库存/订单记录全部保持原状
+# -> 409 { ok:false, code:"shortage",
+#         shortages:[{color:"#00ff00",required:6,oldUsed:2,available:5,shortage:1}],
+#         preview:{...} }
+
+# 6) 旧单不能再取消/修改/删除；两单快照与排样仍可查
+curl -s -X POST localhost:3000/api/cut-orders/1/cancel     # -> 409
+curl -s -X PUT  localhost:3000/api/cut-orders/1 -d '{"copies":9}'  # -> 409
+curl -s -X DELETE localhost:3000/api/cut-orders/1          # -> 409
+curl -s localhost:3000/api/cut-orders/1   # 旧单：status=replaced，layout 仍是 v1 排样
+curl -s localhost:3000/api/cut-orders/7   # 新单：status=confirmed，layout 为 v2 排样
+```
+
+拒绝示例（均明确报错、不替换、不预留）：
+
+```bash
+curl -s -X POST localhost:3000/api/cut-orders/1/replacements/preview \
+  -H 'Content-Type: application/json' -d '{"targetPublicationId":999,"copies":1,"gap":0}'
+# -> 404 目标发布版不存在
+curl -s -X POST localhost:3000/api/cut-orders/1/replacements/preview \
+  -H 'Content-Type:application/json' -d '{"targetPublicationId":8,"copies":1,"gap":0}'
+# -> 400 {"code":"different_design", designIdOld:1, designIdB:3}      # 非同图纸
+curl -s -X POST localhost:3000/api/cut-orders/1/replacements/preview \
+  -H 'Content-Type: application/json' -d '{"targetPublicationId":1,"copies":1,"gap":0}'
+# -> 400 {"code":"same_publication"}                                   # 同版本
+# 对草稿/已取消订单换单 -> 409 {"code":"not_confirmed"}
+# 新排样缺色 / 单片放不下 / 超 60 张 -> 422 missing_color|piece_too_large|too_many_sheets
 ```
 
 ## 铅条生产排产规则
@@ -428,7 +527,7 @@ src/
   printsheet.js          1:1 分张打印（整数毫米分页、拼接标记、逐页 SVG/毫米标尺）
   sheetnest.js           玻璃裁片排样（整数/BigInt 精确净距、90°旋转、左下角首次适应、60 张上限）
 public/
-  index.html / style.css / app.js   单页前端（Canvas 编辑器/发布视图/版本核对/分张打印/铅条生产/玻璃裁片）
+  index.html / style.css / app.js   单页前端（Canvas 编辑器/发布视图/版本核对/分张打印/铅条生产/玻璃裁片/裁片换单）
 test/
   geometry.test.js       几何算法测试（node --test）
   leaddiff.test.js       两版核对：反向/顺序/T接归一、部分重叠拆分、斜向合计舍入、非同图纸报错
@@ -439,4 +538,5 @@ test/
   diff.api.test.js       两版核对端到端测试（GET/POST、404/400、只读不改变快照/计划/库存）
   sheetnest.test.js      裁片排样算法测试（旋转/越板/精确净距/缺色/上限/件次/确定性）
   cutorders.api.test.js  裁片订单端到端（登记/预览/整单拒绝、多色原子预留、并发不超卖、快照绑定）
+  cutreplace.api.test.js 裁片换单端到端（按色预览、同事务替换、不足回滚、幂等/冲突/并发、replaced 锁定、拒绝情形）
 ```

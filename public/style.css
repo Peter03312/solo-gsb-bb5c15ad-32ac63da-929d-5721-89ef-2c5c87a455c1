@@ -266,3 +266,15 @@ td.added.num, th.added.num { color: #2e7d4f; }
   border-radius: 4px;
   background: #fff;
 }
+
+/* 换单面板与结果 */
+.replace-panel, .replace-result {
+  border: 1px solid #c9bfe0;
+  background: #faf8ff;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 10px 0;
+}
+.replace-panel h3, .replace-result h3 { margin: 0 0 6px; font-size: 14px; color: #5b3f91; }
+.replace-result table { margin: 8px 0; background: #fff; }
+.badge[style*="f3e8ff"] { font-weight: 500; }

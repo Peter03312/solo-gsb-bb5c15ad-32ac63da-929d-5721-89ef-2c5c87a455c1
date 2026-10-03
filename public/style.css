@@ -266,3 +266,34 @@ td.added.num, th.added.num { color: #2e7d4f; }
   border-radius: 4px;
   background: #fff;
 }
+
+/* ============ 裁片订单换单 ============ */
+.badge.replace { background: #e7f0ff; color: #1c5dc4; }
+.stock-badge.replace { background: #e7f0ff; color: #1c5dc4; border: 1px solid #9db8e8; }
+.ok-text { color: var(--ok); font-weight: 600; }
+.replace-panel {
+  margin-top: 14px;
+  border: 1px dashed #9db8e8;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #f6f9ff;
+}
+.replace-panel > summary { cursor: pointer; margin-bottom: 6px; }
+.replace-panel label { display: block; margin: 6px 0; }
+.replace-info {
+  margin-top: 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #e7f0ff;
+  color: #1c5dc4;
+  font-size: 13px;
+}
+.link-btn {
+  border: none;
+  background: none;
+  color: #1c5dc4;
+  text-decoration: underline;
+  cursor: pointer;
+  font: inherit;
+  padding: 0 2px;
+}
